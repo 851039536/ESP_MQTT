@@ -63,32 +63,41 @@ pio run -t clean        # 清理构建产物
 ## 目录结构
 
 ```
-platformio.ini      # 唯一的构建配置
-src/                # 全部固件源码（PlatformIO 只编译此目录）
-  main.cpp          # setup()/loop()、WiFi 与 MQTT 逻辑
-  ChipInfo.h/.cpp   # printChipInfo()：输出芯片型号、版本、核心数、无线能力、Flash 大小
-include/            # 预留的头文件目录（当前仅有 PlatformIO 默认 README，未使用）
-lib/                # 预留的私有库目录（当前为空）
-test/               # 预留的单元测试目录（当前为空）
-.pio/               # 构建产物与 libdeps 缓存 —— 已被 .gitignore 忽略，不要提交或手工编辑
+platformio.ini          # 构建配置（含 esp32 与 native 两个环境，见 default_envs 说明）
+src/                    # 依赖 Arduino 的固件代码
+  main.cpp              # setup()/loop()、WiFi 与 MQTT 逻辑、回调派发
+  ChipInfo.h/.cpp       # printChipInfo()：输出芯片型号、版本、核心数、无线能力、Flash 大小
+lib/PureLogic/          # 纯逻辑库：不依赖 Arduino，可在 PC 上编译与测试
+  CommandParser.h/.cpp  #   payload -> Command
+  RelayController.h/.cpp#   输出状态机 + 时间驱动翻转（写引脚可注入）
+test/                   # PC 上运行的单元测试（21 个用例）
+  test_setup_teardown.cpp   # Unity 运行器要求的 setUp/tearDown 空实现
+  test_command_parser/      # 11 个用例
+  test_relay_controller/    # 10 个用例
+include/                # 预留的头文件目录（当前仅有 PlatformIO 默认 README，未使用）
+.pio/                   # 构建产物与 libdeps 缓存 —— 已被 .gitignore 忽略，不要提交或手工编辑
 ```
 
-说明：头文件目前与实现一起放在 `src/`（如 `ChipInfo.h`）。PlatformIO 会自动把 `src/` 加入头文件搜索路径，因此 `#include "ChipInfo.h"` 可直接工作；`include/` 目录尚未启用，不要无谓地搬动文件。
+说明：`ChipInfo.h` 与实现一起放在 `src/`，PlatformIO 会自动把 `src/` 加入头文件搜索路径，因此 `#include "ChipInfo.h"` 可直接工作；`include/` 目录尚未启用，不要无谓地搬动文件。**而纯逻辑模块必须放 `lib/PureLogic/`**，原因见「单元测试」一节。
 
 ## 代码约定
 
 - 沿用现有的 C++/Arduino 风格：4 空格缩进、`#ifndef` 头文件保护（见 `ChipInfo.h`）。
-- 每个功能模块成对提供 `.h` + `.cpp`，头文件中写声明、`.cpp` 中写实现，与 `ChipInfo` 保持一致。
+- 每个功能模块成对提供 `.h` + `.cpp`，头文件中写声明、`.cpp` 中写实现。
 - 引脚与常量定义在文件顶部，宏用全大写（`LED2`），运行期常量用 `const`（`relayPin`）。
 - 面向用户的串口输出可用中文；`Serial.printf` 的格式串使用 `%s` / `%d` / `%u`，注意 `uint32_t` 应使用 `%u`。
 - 函数与文件补充简洁的中文注释说明用途，与现有风格一致。
+- **新增纯逻辑时放到 `lib/PureLogic/` 并配套测试**，不要在 `src/` 里写业务逻辑。`lib/PureLogic/` 内**禁止** `#include <Arduino.h>`。
+- 修改 `lib/PureLogic/` 的行为后，必须同步更新 `test/` 下对应用例并实际运行 `pio test -e native`。
 
 ## 硬件与运行时行为（修改前务必了解）
 
 - 代码中的引脚定义：板载 LED `LED2 = GPIO2`，继电器 `relayPin = GPIO13`。
-- `loop()` 当前以 1 秒为周期**无条件**翻转 GPIO13（继电器）并打印 `13 ON` / `13 OFF`。**该逻辑是阻塞式的**，会拖慢 MQTT 收发；如需改成非阻塞，请用 `millis()` 时间戳替换 `delay()`。
-- MQTT 回调约定：负载为 `onled2` 时点亮 GPIO2，为 `off` 时熄灭，其他内容仅打印。注意两者命名不对称（`onled2` 而非 `on`），修改时保持向后兼容或同步更新设备端与 broker 端的发布内容。
-- 客户端 ID 由 `esp32s2-` 前缀加 `WiFi.macAddress()` 生成，用于避免多设备抢占同一会话（该前缀的型号含义有误，见上节）。
+- `loop()` 现在是**纯非阻塞**的：调用 `led.update(millis())`（时间驱动）、MQTT 重连检查、`client.loop()`。早先那对 `delay(1000)` 已删除。
+- 继电器默认**不会**自动动作（`RELAY_BLINK_PERIOD_MS = 0`）；如需心跳指示可把该常量改为非 0，翻转由 `RelayController::update()` 按时间戳驱动，不阻塞。
+- MQTT 回调约定：负载为 `onled2` 点亮 GPIO2，为 `off` 熄灭，其他内容静默忽略（不再回显）。注意两者命名不对称（`onled2` 而非 `on`），修改时保持向后兼容或同步更新设备端与 broker 端。
+- 解析规则由 `lib/PureLogic/CommandParser.cpp` 定义，**区分大小写**、要求长度完全相等；有 11 个用例覆盖边界情况，改规则请同步改测试。
+- 客户端 ID 由 `esp32-` 前缀加 `WiFi.macAddress()` 生成，用于避免多设备抢占同一会话。
 - `connectToMqttBroker()` 是**阻塞重试循环**（失败后 `delay(2000)` 重试），在 `setup()` 和 `loop()` 中都会被调用。
 - **GPIO2 是 ESP32 的 strapping 引脚**（ESP-IDF GPIO 文档明确标注：GPIO0、GPIO2、GPIO5、GPIO12、GPIO15 为 strapping 引脚），启动时被采样以决定启动模式，复位时默认内部下拉。把它当普通输出在启动**之后**使用通常没问题（官方 blink 示例即如此），但若外部电路在复位瞬间把它**拉高**，可能干扰启动——加继电器/LED 外围电路时需留意。
 - `GPIO13` 在通用 ESP32 上是普通可用引脚（标注为 JTAG 用途，非 strapping），但**在真实 WROVER-KIT 上被 JTAG 与 microSD 共用**（见上节）。
@@ -97,15 +106,15 @@ test/               # 预留的单元测试目录（当前为空）
 
 以下问题按严重程度排列，均可在源码中直接定位。**不要把它们当作"设计如此"而忽略**，但修复前应先与维护者确认预期行为，因为其中几条涉及产品意图：
 
-1. **凭据明文硬编码**（`src/main.cpp:14-22`）：WiFi 与 MQTT 的账号密码直接写在源码里。这是最优先处理的问题，详见下一节。
-2. **继电器无法通过 MQTT 控制**（`src/main.cpp:93-98`）：`loop()` 无条件翻转继电器，MQTT 只能控制 LED。若要远程控制继电器，这条无条件循环必须去掉或改为状态驱动。
-3. **`loop()` 阻塞**（`src/main.cpp:95,98`）：两个 `delay(1000)` 让 `client.loop()` 每秒最多只跑一次，下行命令延迟可达约 2 秒；MQTT keepalive 也可能因此受影响。
-4. **MQTT 无重连退避**（`src/main.cpp:75-89`）：`setup()` 中若 broker 不可达会**永久卡在 `connectToMqttBroker()`**，设备表现为"死机"且不重试 WiFi。`loop()` 中的重连也无指数退避，会每 2 秒无限重试。
-5. **WiFi 连接无超时**（`src/main.cpp:41-44`）：`while (WiFi.status() != WL_CONNECTED)` 无超时、无失败提示，WiFi 不可用时会永久卡住。
-6. **回调无边界校验**（`src/main.cpp:58-73`）：payload 未做长度上限与 `nullptr` 校验，逐字节拼进 `String` 可能触发堆碎片或内存耗尽；PubSubClient 默认缓冲仅 256 字节。
-7. **无遗嘱/状态上报**：固件不发布任何主题，设备离线或执行结果对 broker 侧不可见。
-8. **`client_id` 前缀型号错误**（`src/main.cpp:77`）：`esp32s2-` 与实际的经典 ESP32 不符，仅影响可读性。
-9. **`serial` 输出与功能不一致的细节**：`setup()` 打印的 "The client %s connects to the public mqtt broker" 措辞暗示是公共 broker，但实际连的是局域网私有地址 `192.168.139.206`。
+1. **凭据明文硬编码**（`src/main.cpp`）：WiFi 与 MQTT 的账号密码直接写在源码里。**这是当前最优先、且尚未处理的问题**，详见下一节。
+2. ~~继电器无法通过 MQTT 控制~~ —— **已修复**：删除了 `loop()` 中的无条件翻转。
+3. ~~`loop()` 阻塞~~ —— **已修复**：已移除两个 `delay(1000)`，改为 `millis()` 时间驱动。
+4. **MQTT 无重连退避**：`setup()` 中若 broker 不可达会**永久卡在 `connectToMqttBroker()`**，设备表现为"死机"且不重试 WiFi。`loop()` 中的重连也无指数退避，会每 2 秒无限重试。**尚未处理。**
+5. **WiFi 连接无超时**：`while (WiFi.status() != WL_CONNECTED)` 无超时、无失败提示，WiFi 不可用时会永久卡住。**尚未处理。**
+6. ~~回调无边界校验~~ —— **已修复**：`parseCommand()` 按长度解析并校验 `nullptr`，不再逐字节拼 `String`；新增 `test_command_parser` 覆盖该风险。
+7. **无遗嘱/状态上报**：固件不发布任何主题，设备离线或执行结果对 broker 侧不可见。**尚未处理。**
+8. ~~`client_id` 前缀型号错误~~ —— **已修复**：`esp32s2-` 已改为 `esp32-`。
+9. ~~串口措辞与功能不一致~~ —— **已修复**：日志中的 "public mqtt broker" 已改为 "mqtt broker"。
 
 ## 敏感信息与配置
 
@@ -116,17 +125,81 @@ test/               # 预留的单元测试目录（当前为空）
 
 ## 验证方式
 
-仓库当前**没有自动化测试**（`test/` 为空，未配置测试框架），因此改动后必须人工验证：
+**改动的验证分两层，两层都要做：**
+
+**第一层：PC 上的自动化测试（快，秒级，无需开发板）**
+
+```bash
+pio test -e native
+```
+
+改动 `lib/PureLogic/` 后**必须**跑这一步，当前为 21 个用例全部通过。若新增了纯逻辑而未加测试，视为改动未完成。
+
+**第二层：真机人工验证（涉及硬件/网络，无法自动化）**
 
 1. `pio run` 确认编译通过（无新增警告）。
 2. `pio run -t upload` 烧录，`pio device monitor` 观察串口是否打印芯片信息、WiFi 与 MQTT 连接日志。**首次连接新板子时，先看 `Chip model:` 这一行确认实际芯片型号。**
 3. 向 `TOPIC1` 发布 `onled2` / `off`，确认 GPIO2 与串口输出符合预期。
-4. 若改动了 `loop()` 中的继电器逻辑，确认 MQTT 命令的响应延迟仍在可接受范围。
+4. 若改动了继电器相关逻辑，确认 MQTT 命令的响应延迟仍在可接受范围。
 
-请不要声称"已通过测试"，除非确实执行了上述步骤。
+**注意：** 第二层无法自动化，因为仓库使用的是 `native` PC 测试而非上板测试。因此**不要声称"已在真机验证"**，除非确实烧录并观察过串口；同理，`pio test -e native` 通过**不等于**固件在硬件上工作正常。
+
+### 单元测试的运行前提与配置约束
+
+**工具链前提（本机已装好）：** PlatformIO 的 native 平台不自带工具链，依赖系统 `gcc`。本机原先没有 gcc，已安装 **MinGW-w64 GCC 14.2.0** 到：
+
+```
+%LOCALAPPDATA%\mingw64\mingw64\bin
+```
+
+并已加入**用户级 PATH**（新开的终端自动生效）。若在别的机器上克隆本仓库，需先自行安装 gcc，否则 `pio test -e native` 会报 `'gcc' is not recognized`；注意**这不会影响 `pio run`**（见下）。
+
+**两个关键的配置约束，改动时务必保留：**
+
+1. **`default_envs = esp-wrover-kit` 必须保留。** 否则 `pio run`（不带 `-e`）会连 native 环境一起构建，在没有 gcc 的机器上**直接失败**——即"加测试反而弄坏了构建"。已实测：移除 gcc 后 `pio run` 仍能正常成功。
+2. **纯逻辑模块必须放在 `lib/PureLogic/`，不要放回 `src/`。** PlatformIO 只对 `lib/` 下的库做自动编译与包含，且 `src/main.cpp`、`src/ChipInfo.cpp` 依赖 `WiFi.h` / `Arduino.h`，native 环境无法编译它们。若把这些模块移回 `src/` 并打开 `test_build_src`，`pio test -e native` 会因找不到 `Arduino.h` / `WiFi.h` 而失败（已实际踩到）。
+
+**测试目录结构：**
+
+```
+lib/PureLogic/            # 纯逻辑库（不依赖 Arduino，可在 PC 编译）
+  CommandParser.h/.cpp    #   payload -> Command
+  RelayController.h/.cpp  #   时间驱动 + 注入式写引脚
+test/
+  test_setup_teardown.cpp # PlatformIO Unity 运行器要求的 setUp/tearDown 空实现
+  test_command_parser/    # 11 个用例
+  test_relay_controller/  # 10 个用例
+```
+
+关于"上板测试"（`pio test -e esp-wrover-kit`）：PlatformIO 的测试构建会**替换掉 `src/main.cpp`**，Arduino 的 `main.cpp` 因而找不到 `setup()`/`loop()`，报 `undefined reference to 'setup()'`。本工程当前**只支持 PC 上的 native 测试**；若将来要做上板测试，需要在测试中自行提供 `setup()`/`loop()` 桩函数。
+
+## 模块化结构（已实施）
+
+原先所有逻辑挤在 `main.cpp` 里，任何一部分都无法在不碰硬件的情况下测试。现已完成解耦：
+
+| 模块 | 位置 | 职责 | 可测性 |
+| --- | --- | --- | --- |
+| `CommandParser` | `lib/PureLogic/` | payload（字节 + 长度）→ `Command` 枚举 | **纯函数，11 个用例** |
+| `RelayController` | `lib/PureLogic/` | 输出状态 + 时间驱动翻转，写引脚可注入 | **纯逻辑，10 个用例**（假时间戳，不真的等待） |
+| `main.cpp` | `src/` | WiFi/MQTT 连接、回调派发、`loop()` | 需硬件 |
+| `ChipInfo` | `src/` | 芯片信息打印 | 无需测试 |
+
+**分层原则（新增代码请遵循）：**
+
+- **纯逻辑（无 Arduino 依赖、无动态分配、无阻塞）一律放 `lib/PureLogic/`**，这样它天然可在 PC 上被测试。判断标准很简单：能不能只 `#include <stddef.h>` 就写完？能，就放 `lib/`。
+- **副作用集中在 `src/`**：`digitalWrite`、`Serial`、`WiFi`、`client.loop()` 只出现在 `src/` 与注入的回调里。
+- 需要与硬件交互的纯逻辑，用**注入回调**（见 `RelayController` 的 `WritePinFn`）而不是直接调用 `digitalWrite`。
+
+### 本次重构改动的行为（重要）
+
+1. **删除了 `loop()` 中无条件的继电器闪烁。** 经确认该逻辑属于调试遗留：它既用 `delay(1000)` 阻塞主循环（使 MQTT 下行延迟可达约 2 秒），又让继电器完全无法被 MQTT 控制。现在继电器引脚上电后保持 LOW，`loop()` 为纯非阻塞。
+   - 如将来确实需要心跳指示，把 `RELAY_BLINK_PERIOD_MS` 改成非 0 即可（已保留该能力，且它是非阻塞的、会被 MQTT 命令覆盖）。
+2. **回调不再把 payload 逐字节拼进 `String`。** 改为 `parseCommand()` 按长度解析，因此顺带修掉了原先"无长度上限 / 无 `nullptr` 校验 / 堆分配"的风险（原问题清单第 6 条）。
+3. **未知命令不再回显 payload 内容**，只静默忽略，避免把任意内容写进串口。
 
 ## 注意事项
 
-- 只提交 `src/`、`platformio.ini` 等源码与配置；`.pio/` 属于构建缓存，始终保持在 `.gitignore` 中。
+- 只提交 `src/`、`lib/`、`test/`、`platformio.ini` 等源码与配置；`.pio/` 属于构建缓存，始终保持在 `.gitignore` 中。
 - 修改 `platformio.ini` 中的 board 或 platform 时，需同步检查引脚定义（GPIO2 / GPIO13 仅对当前假定板卡成立，且该假定本身存疑，见上）。
 - 该工程有 `.idea/` 目录（CLion/IntelliJ 工程文件，已包含 PlatformIO 插件配置），属于本地 IDE 配置，一般不需要改动。
+- `lib/PureLogic/` 是**唯一**允许存放跨平台纯逻辑的地方，不要把 Arduino 依赖引入其中，否则 PC 测试会立刻失效。
